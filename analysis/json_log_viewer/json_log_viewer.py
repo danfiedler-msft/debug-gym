@@ -1,19 +1,42 @@
+import argparse
 import hashlib
 import json
 import logging
 import os
 import re
 import shlex
+import stat
+import uuid
+from pathlib import Path
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
-from flask_cors import cross_origin
 from werkzeug.utils import secure_filename
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 5050
+DEFAULT_SAFE_ROOT = Path.cwd().resolve()
+DEFAULT_TRUSTED_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+ALLOWED_SUFFIXES = {".json", ".jsonl"}
+
+
+def _configured_origins() -> tuple[str, ...]:
+    value = os.environ.get("JSON_LOG_VIEWER_ALLOWED_ORIGINS", "")
+    return tuple(
+        origin.strip().rstrip("/") for origin in value.split(",") if origin.strip()
+    )
+
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = "uploads"
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max file size
-# Define a safe root directory for browsing
-SAFE_ROOT = os.getcwd()
+app.config["SAFE_ROOT"] = (
+    Path(os.environ.get("JSON_LOG_VIEWER_SAFE_ROOT", DEFAULT_SAFE_ROOT))
+    .expanduser()
+    .resolve()
+)
+app.config["ALLOWED_ORIGINS"] = _configured_origins()
+app.config["TRUSTED_HOSTS"] = list(DEFAULT_TRUSTED_HOSTS)
+SAFE_ROOT = DEFAULT_SAFE_ROOT
 
 # Create uploads directory if it doesn't exist
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
@@ -21,6 +44,110 @@ os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
 # Global variable to store loaded data
 data = None
 current_file = None
+
+
+class SafePathError(ValueError):
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def resolve_safe_path(
+    raw_path: str,
+    *,
+    allowed_suffixes: set[str] | None = None,
+    expect: str | None = None,
+) -> Path:
+    """Resolve a user path canonically and confine it to the configured root."""
+    if not raw_path:
+        raise SafePathError("A path is required", 400)
+
+    try:
+        safe_root = Path(app.config["SAFE_ROOT"]).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SafePathError("The configured safe root is unavailable", 500) from exc
+
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = safe_root / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise SafePathError("Invalid path", 400) from exc
+
+    try:
+        resolved.relative_to(safe_root)
+    except ValueError as exc:
+        raise SafePathError("Access denied", 403) from exc
+
+    if expect == "file" and not resolved.is_file():
+        raise SafePathError("File not found", 404)
+    if expect == "directory" and not resolved.is_dir():
+        raise SafePathError("Invalid directory", 400)
+    if allowed_suffixes is not None and resolved.suffix.lower() not in allowed_suffixes:
+        raise SafePathError("Invalid file type", 400)
+    return resolved
+
+
+def save_uploaded_json(file_storage) -> tuple[str, dict | list]:
+    """Save an upload to an exclusive server-generated path and parse it in-place."""
+    filename = secure_filename(file_storage.filename)
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_SUFFIXES:
+        raise SafePathError("Invalid file type", 400)
+
+    configured_root = Path(app.config["UPLOAD_FOLDER"]).absolute()
+    if configured_root.is_symlink():
+        raise OSError("Upload folder must not be a symbolic link")
+    configured_root.mkdir(parents=True, exist_ok=True)
+    upload_root = configured_root.resolve(strict=True)
+    filepath = upload_root / f"{uuid.uuid4().hex}{suffix}"
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    descriptor = os.open(filepath, flags, 0o600)
+    try:
+        with os.fdopen(os.dup(descriptor), "wb") as destination:
+            file_storage.save(destination)
+        descriptor_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_stat.st_mode) or descriptor_stat.st_nlink != 1:
+            raise OSError("Upload destination is not a regular file")
+        with os.fdopen(os.dup(descriptor), "rb") as source:
+            source.seek(0)
+            content = source.read(app.config["MAX_CONTENT_LENGTH"] + 1)
+        if len(content) > app.config["MAX_CONTENT_LENGTH"]:
+            raise OSError("Uploaded file exceeds the size limit")
+        return filename, json.loads(content.decode("utf-8"))
+    except Exception:
+        filepath.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(descriptor)
+
+
+@app.before_request
+def reject_untrusted_cross_origin_loads():
+    origin = request.headers.get("Origin")
+    if (
+        request.endpoint == "load_file_from_path"
+        and origin
+        and origin.rstrip("/") not in set(app.config.get("ALLOWED_ORIGINS", ()))
+    ):
+        return jsonify({"error": "Origin not allowed"}), 403
+
+
+@app.after_request
+def add_configured_cors_header(response):
+    origin = request.headers.get("Origin")
+    if (
+        request.endpoint == "load_file_from_path"
+        and origin
+        and origin.rstrip("/") in set(app.config.get("ALLOWED_ORIGINS", ()))
+    ):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers.add("Vary", "Origin")
+    return response
 
 
 ACTION_COLOR_PALETTE = [
@@ -464,24 +591,18 @@ def file_upload():
         if file.filename == "":
             return render_template("upload.html", error="No file selected")
 
-        if file and (
-            file.filename.endswith(".json") or file.filename.endswith(".jsonl")
-        ):
-            filename = secure_filename(file.filename)
-            filepath = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-            file.save(filepath)
-
+        if file:
             try:
-                with open(filepath, "r") as f:
-                    data = json.load(f)
+                filename, data = save_uploaded_json(file)
                 current_file = filename
                 return redirect(url_for("index"))
+            except SafePathError as exc:
+                return render_template("upload.html", error=str(exc)), exc.status_code
             except json.JSONDecodeError:
                 return render_template("upload.html", error="Invalid JSON file")
-            except Exception as e:
-                return render_template(
-                    "upload.html", error=f"Error loading file: {str(e)}"
-                )
+            except (OSError, UnicodeError):
+                logging.exception("Failed to load uploaded trajectory")
+                return render_template("upload.html", error="Unable to load file")
         else:
             return render_template(
                 "upload.html", error="Please upload a JSON or JSONL file"
@@ -494,122 +615,105 @@ def file_upload():
 def load_from_cwd(filename):
     global data, current_file
 
-    # Sanitize filename to prevent directory traversal
     filename = secure_filename(filename)
-
-    # Check if file exists and has valid extension
-    if not (filename.endswith(".json") or filename.endswith(".jsonl")):
-        return render_template("upload.html", error="Invalid file type")
-
-    if not os.path.exists(filename):
-        return render_template("upload.html", error="File not found")
-
     try:
-        with open(filename, "r") as f:
+        filepath = resolve_safe_path(
+            filename, allowed_suffixes=ALLOWED_SUFFIXES, expect="file"
+        )
+        with filepath.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        current_file = filename
+        current_file = filepath.name
         return redirect(url_for("index"))
+    except SafePathError as exc:
+        return render_template("upload.html", error=str(exc)), exc.status_code
     except json.JSONDecodeError:
         return render_template("upload.html", error="Invalid JSON file")
-    except Exception as e:
-        return render_template("upload.html", error=f"Error loading file: {str(e)}")
+    except (OSError, UnicodeError):
+        logging.exception("Failed to load trajectory")
+        return render_template("upload.html", error="Unable to load file"), 500
 
 
 @app.route("/browse_directory")
 def browse_directory():
     """Browse directory contents via AJAX"""
-    path = request.args.get("path", SAFE_ROOT)
-
-    # Sanitize path to prevent directory traversal attacks
     try:
-        path = os.path.abspath(path)
-        # Ensure path is within SAFE_ROOT
-        if not path.startswith(SAFE_ROOT):
-            return (
-                jsonify({"error": "Access denied: Path outside allowed directory"}),
-                403,
-            )
-        if not os.path.exists(path) or not os.path.isdir(path):
-            return jsonify({"error": "Invalid directory"}), 400
-    except (OSError, ValueError):
-        return jsonify({"error": "Invalid path"}), 400
-
-    try:
+        safe_root = Path(app.config["SAFE_ROOT"]).expanduser().resolve(strict=True)
+        path = resolve_safe_path(
+            request.args.get("path", str(safe_root)), expect="directory"
+        )
         items = []
 
         # Add parent directory if not at root
-        if path != os.path.dirname(path):  # Not at root
-            parent_path = os.path.dirname(path)
+        if path != safe_root:
             items.append(
                 {
                     "name": "..",
-                    "path": parent_path,
+                    "path": str(path.parent),
                     "type": "directory",
                     "is_parent": True,
                 }
             )
 
         # List directory contents
-        for item in sorted(os.listdir(path)):
-            item_path = os.path.join(path, item)
+        for item_path in sorted(path.iterdir(), key=lambda item: item.name):
             try:
-                if os.path.isdir(item_path):
+                resolved_item = resolve_safe_path(str(item_path))
+                if resolved_item.is_dir():
                     items.append(
                         {
-                            "name": item,
-                            "path": item_path,
+                            "name": item_path.name,
+                            "path": str(resolved_item),
                             "type": "directory",
                             "is_parent": False,
                         }
                     )
-                elif item.endswith((".json", ".jsonl")):
+                elif (
+                    resolved_item.is_file()
+                    and resolved_item.suffix.lower() in ALLOWED_SUFFIXES
+                ):
                     items.append(
                         {
-                            "name": item,
-                            "path": item_path,
+                            "name": item_path.name,
+                            "path": str(resolved_item),
                             "type": "file",
                             "is_parent": False,
                         }
                     )
-            except (OSError, PermissionError):
-                # Skip items we can't access
+            except (OSError, SafePathError):
                 continue
 
-        return jsonify({"current_path": path, "items": items})
-
-    except (OSError, PermissionError) as e:
+        return jsonify({"current_path": str(path), "items": items})
+    except SafePathError as exc:
+        return jsonify({"error": str(exc)}), exc.status_code
+    except (OSError, PermissionError):
         logging.exception("Error while browsing directory")
         return jsonify({"error": "Permission denied"}), 403
 
 
 @app.route("/load_file_from_path")
-@cross_origin()  # Allow cross-origin requests (for Gray Tree Frog visualization)
 def load_file_from_path():
     """Load a JSON file from a specific path"""
     global data, current_file
 
-    filepath = request.args.get("path")
-    if not filepath:
-        return jsonify({"error": "No file path provided"}), 400
-
     try:
-        filepath = os.path.abspath(filepath)
-        if not os.path.exists(filepath) or not os.path.isfile(filepath):
-            return jsonify({"error": "File not found"}), 404
-
-        if not filepath.endswith((".json", ".jsonl")):
-            return jsonify({"error": "Invalid file type"}), 400
-
-        with open(filepath, "r") as f:
+        filepath = resolve_safe_path(
+            request.args.get("path", ""),
+            allowed_suffixes=ALLOWED_SUFFIXES,
+            expect="file",
+        )
+        with filepath.open("r", encoding="utf-8") as f:
             data = json.load(f)
 
-        current_file = os.path.basename(filepath)
+        current_file = filepath.name
         return jsonify({"success": True, "redirect": url_for("index")})
 
+    except SafePathError as exc:
+        return jsonify({"error": str(exc)}), exc.status_code
     except json.JSONDecodeError:
         return jsonify({"error": "Invalid JSON file"}), 400
-    except Exception as e:
-        return jsonify({"error": f"Error loading file: {str(e)}"}), 500
+    except (OSError, UnicodeError):
+        logging.exception("Failed to load trajectory")
+        return jsonify({"error": "Unable to load file"}), 500
 
 
 @app.route("/get_step/<int:step_id>")
@@ -674,5 +778,48 @@ def change_file():
     return redirect(url_for("file_upload"))
 
 
+def main():
+    parser = argparse.ArgumentParser(description="View debug-gym trajectory logs")
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("JSON_LOG_VIEWER_HOST", DEFAULT_HOST),
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=int(os.environ.get("JSON_LOG_VIEWER_PORT", DEFAULT_PORT)),
+    )
+    parser.add_argument(
+        "--safe-root",
+        type=Path,
+        default=app.config["SAFE_ROOT"],
+        help="Only files below this directory may be browsed or loaded",
+    )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        help="Exact origin allowed to use the cross-origin load integration",
+    )
+    parser.add_argument(
+        "--trusted-host",
+        action="append",
+        help="Exact Host header accepted by the viewer",
+    )
+    args = parser.parse_args()
+
+    try:
+        app.config["SAFE_ROOT"] = args.safe_root.expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        parser.error(f"safe root is unavailable: {exc}")
+    if args.allowed_origin is not None:
+        app.config["ALLOWED_ORIGINS"] = tuple(
+            origin.rstrip("/") for origin in args.allowed_origin
+        )
+    if args.trusted_host is not None:
+        app.config["TRUSTED_HOSTS"] = args.trusted_host
+    app.run(host=args.host, port=args.port)
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5050)
+    main()

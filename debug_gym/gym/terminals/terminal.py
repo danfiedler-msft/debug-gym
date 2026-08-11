@@ -1,5 +1,7 @@
 import atexit
+import shlex
 import tempfile
+import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -127,6 +129,157 @@ class Terminal(ABC):
 
     def __str__(self):
         return f"Terminal[{self.working_dir}]"
+
+    def write_text(
+        self, filepath: str | Path, content: str, encoding: str = "utf-8"
+    ) -> None:
+        """Write text without embedding it in a shell command."""
+        if not isinstance(content, str):
+            raise TypeError("content must be a string")
+        self.write_bytes(filepath, content.encode(encoding))
+
+    def _compatibility_write_metadata(
+        self, target: Path
+    ) -> tuple[int, int, int, int, int]:
+        user_success, user_output = self.run("id -u", raises=False)
+        group_success, group_output = self.run("id -g", raises=False)
+        groups_success, groups_output = self.run("id -G", raises=False)
+        if not user_success or not group_success or not groups_success:
+            raise TerminalError("Failed to determine the terminal user")
+        runtime_user_id = int(user_output.splitlines()[-1])
+        runtime_group_id = int(group_output.splitlines()[-1])
+        runtime_group_ids = {
+            int(group) for group in groups_output.splitlines()[-1].split()
+        }
+
+        exists, _ = self.run(
+            f"test -e {shlex.quote(str(target))}",
+            raises=False,
+        )
+        if exists:
+            is_regular, _ = self.run(
+                f"test -f {shlex.quote(str(target))}",
+                raises=False,
+            )
+            if not is_regular:
+                raise TerminalError("Write target must be a regular file")
+            metadata_success, metadata_output = self.run(
+                f"stat -c '%a %u %g' -- {shlex.quote(str(target))}",
+                raises=False,
+            )
+            if not metadata_success:
+                raise TerminalError("Failed to inspect destination file")
+            mode, user_id, group_id = metadata_output.splitlines()[-1].split()
+            user_id = int(user_id)
+            group_id = int(group_id)
+            if runtime_user_id != 0 and (
+                user_id != runtime_user_id
+                or (
+                    group_id not in runtime_group_ids
+                    and not self._compatibility_inherits_parent_group(
+                        target.parent, group_id
+                    )
+                )
+            ):
+                raise TerminalError("Cannot preserve destination file ownership")
+            return (
+                int(mode, 8) & ~0o6000,
+                user_id,
+                group_id,
+                runtime_user_id,
+                runtime_group_id,
+            )
+
+        umask_success, umask_output = self.run("umask", raises=False)
+        parent_success, parent_output = self.run(
+            f"stat -c '%a %g' -- {shlex.quote(str(target.parent))}",
+            raises=False,
+        )
+        if not umask_success or not parent_success:
+            raise TerminalError("Failed to determine destination file metadata")
+        parent_mode, parent_group_id = parent_output.splitlines()[-1].split()
+        group_id = (
+            int(parent_group_id) if int(parent_mode, 8) & 0o2000 else runtime_group_id
+        )
+        mode = 0o666 & ~int(umask_output.splitlines()[-1], 8)
+        return (
+            mode,
+            runtime_user_id,
+            group_id,
+            runtime_user_id,
+            runtime_group_id,
+        )
+
+    def _compatibility_inherits_parent_group(self, parent: Path, group_id: int) -> bool:
+        success, output = self.run(
+            f"stat -c '%a %g' -- {shlex.quote(str(parent))}",
+            raises=False,
+        )
+        if not success:
+            raise TerminalError("Failed to inspect destination directory")
+        parent_mode, parent_group_id = output.splitlines()[-1].split()
+        return bool(int(parent_mode, 8) & 0o2000 and int(parent_group_id) == group_id)
+
+    def write_bytes(self, filepath: str | Path, content: bytes) -> None:
+        """Compatibility transport for backends that implement copy_content."""
+        if not isinstance(content, bytes):
+            raise TypeError("content must be bytes")
+
+        target = Path(filepath)
+        temporary_name = f".debug-gym-write-{uuid.uuid4().hex}.tmp"
+        remote_temporary_path = target.parent / temporary_name
+        with tempfile.TemporaryDirectory(prefix="DebugGym-write-") as staging:
+            staging_path = Path(staging)
+            (staging_path / temporary_name).write_bytes(content)
+
+            success, output = self.run(
+                f"mkdir -p -- {shlex.quote(str(target.parent))}",
+                raises=False,
+            )
+            if not success:
+                raise TerminalError(f"Failed to create destination directory: {output}")
+
+            (
+                mode,
+                user_id,
+                group_id,
+                runtime_user_id,
+                runtime_group_id,
+            ) = self._compatibility_write_metadata(target)
+            try:
+                self.copy_content(staging_path, target.parent)
+                metadata_commands = [
+                    f"chmod {mode:o} -- " f"{shlex.quote(str(remote_temporary_path))}"
+                ]
+                if runtime_user_id == 0:
+                    metadata_commands.append(
+                        f"chown {user_id}:{group_id} -- "
+                        f"{shlex.quote(str(remote_temporary_path))}"
+                    )
+                elif group_id != runtime_group_id:
+                    metadata_commands.append(
+                        "(test "
+                        f'"$(stat -c %g -- '
+                        f'{shlex.quote(str(remote_temporary_path))})" '
+                        f"= {group_id} || chgrp {group_id} -- "
+                        f"{shlex.quote(str(remote_temporary_path))})"
+                    )
+                metadata_commands.append(
+                    "mv -f -- "
+                    f"{shlex.quote(str(remote_temporary_path))} "
+                    f"{shlex.quote(str(target))}"
+                )
+                success, output = self.run(
+                    " && ".join(metadata_commands),
+                    raises=False,
+                )
+                if not success:
+                    raise TerminalError(f"Failed to replace destination file: {output}")
+            finally:
+                self.run(
+                    f"rm -f -- {shlex.quote(str(remote_temporary_path))}",
+                    raises=False,
+                )
 
     @abstractmethod
     def copy_content(self, src: str | Path, target: str | Path | None = None) -> None:

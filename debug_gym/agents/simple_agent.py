@@ -1,3 +1,4 @@
+import math
 import re
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -157,18 +158,35 @@ class SimpleAgent(BaseAgent):
         types = arg_schema.get("type", [])
         if not isinstance(types, list):
             types = [types]
+
+        if "null" in types and value.lower() == "null":
+            return None
+
         for t in types:
+            if t == "integer":
+                if re.fullmatch(r"[+-]?\d+", value):
+                    return int(value)
             if t == "number":
                 try:
-                    # Prefer int if the value has no decimal point
-                    return int(value) if "." not in value else float(value)
-                except (ValueError, TypeError):
+                    number = (
+                        int(value) if re.fullmatch(r"[+-]?\d+", value) else float(value)
+                    )
+                    if isinstance(number, int) or math.isfinite(number):
+                        return number
+                except (OverflowError, TypeError, ValueError):
                     continue
             if t == "boolean":
                 if value.lower() in ("true", "1"):
                     return True
                 if value.lower() in ("false", "0"):
                     return False
+
+        if "string" in types:
+            return value
+        declared_scalar_types = {"integer", "number", "boolean"}.intersection(types)
+        if declared_scalar_types:
+            expected = " or ".join(sorted(declared_scalar_types))
+            raise ValueError(f"Expected {expected}, got {value!r}")
         return value
 
     def parse_tool_calls(self, text: str) -> List[ToolCall]:
@@ -214,9 +232,14 @@ class SimpleAgent(BaseAgent):
             for param_key, param_value in param_matches:
                 param_key = param_key.strip()
                 param_value = param_value.strip()
-                params[param_key] = self._cast_param(
-                    param_value, tool_arg_schema.get(param_key)
-                )
+                try:
+                    params[param_key] = self._cast_param(
+                        param_value, tool_arg_schema.get(param_key)
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid value for parameter {param_key!r}: {exc}"
+                    ) from exc
 
             tool_calls.append(ToolCall(id="None", name=function_name, arguments=params))
 

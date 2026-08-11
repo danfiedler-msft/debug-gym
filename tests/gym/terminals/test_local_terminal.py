@@ -1,9 +1,37 @@
+import os
 import re
 
 import pytest
 
 from debug_gym.gym.terminals.local import LocalTerminal
-from debug_gym.gym.terminals.terminal import UnrecoverableTerminalError
+from debug_gym.gym.terminals.terminal import (
+    Terminal,
+    TerminalError,
+    UnrecoverableTerminalError,
+)
+
+
+def test_local_terminal_requires_explicit_opt_in(monkeypatch):
+    monkeypatch.delenv("ALLOW_LOCAL_TERMINAL", raising=False)
+
+    with pytest.raises(TerminalError, match="ALLOW_LOCAL_TERMINAL=true"):
+        LocalTerminal()
+
+
+@pytest.mark.parametrize("value", ["", "yes", "1", "tru", "false"])
+def test_local_terminal_rejects_disabled_or_malformed_opt_in(monkeypatch, value):
+    monkeypatch.setenv("ALLOW_LOCAL_TERMINAL", value)
+
+    with pytest.raises(TerminalError, match="ALLOW_LOCAL_TERMINAL=true"):
+        LocalTerminal()
+
+
+def test_local_terminal_explicit_opt_in_allows_execution(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALLOW_LOCAL_TERMINAL", "TrUe")
+
+    terminal = LocalTerminal(working_dir=str(tmp_path))
+
+    assert terminal.run("printf enabled") == (True, "enabled")
 
 
 def test_terminal_run(tmp_path):
@@ -261,3 +289,68 @@ def test_copy_content(tmp_path):
     with open(working_dir / "tmp.txt", "r") as f:
         content = f.read()
     assert content == "Hello World"
+
+
+def test_write_text_preserves_untrusted_content(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALLOW_LOCAL_TERMINAL", "true")
+    terminal = LocalTerminal(working_dir=str(tmp_path))
+    side_effect = tmp_path / "side-effect"
+    content = (
+        "Unicode: café 世界 🚀\n"
+        "DEBUGGYM_EOF\n"
+        f"$(touch {side_effect}) `touch {side_effect}`; touch {side_effect}\n"
+        + ("x" * (2 * 1024 * 1024))
+        + "\n"
+    )
+
+    terminal.write_text(tmp_path / "payload.txt", content)
+
+    assert (tmp_path / "payload.txt").read_bytes() == content.encode("utf-8")
+    assert not side_effect.exists()
+
+
+def test_base_write_adapter_keeps_content_out_of_shell(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALLOW_LOCAL_TERMINAL", "true")
+    terminal = LocalTerminal(working_dir=str(tmp_path))
+    side_effect = tmp_path / "side-effect"
+    content = f"DEBUGGYM_EOF\n$(touch {side_effect})\n".encode()
+
+    Terminal.write_bytes(terminal, tmp_path / "adapter.txt", content)
+
+    assert (tmp_path / "adapter.txt").read_bytes() == content
+    assert not side_effect.exists()
+
+    executable = tmp_path / "executable"
+    executable.write_text("old", encoding="utf-8")
+    executable.chmod(0o755)
+    Terminal.write_bytes(terminal, executable, b"new")
+    assert executable.read_bytes() == b"new"
+    assert executable.stat().st_mode & 0o777 == 0o755
+
+
+def test_write_text_honors_process_umask(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALLOW_LOCAL_TERMINAL", "true")
+    terminal = LocalTerminal(working_dir=str(tmp_path))
+    previous_umask = os.umask(0o077)
+    try:
+        terminal.write_text(tmp_path / "private.txt", "private")
+    finally:
+        os.umask(previous_umask)
+
+    assert (tmp_path / "private.txt").stat().st_mode & 0o777 == 0o600
+
+
+def test_write_text_honors_session_umask(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALLOW_LOCAL_TERMINAL", "true")
+    terminal = LocalTerminal(
+        working_dir=str(tmp_path),
+        session_commands=["umask 0077"],
+    )
+    previous_umask = os.umask(0o022)
+    try:
+        terminal.write_text(tmp_path / "private" / "data.txt", "private")
+    finally:
+        os.umask(previous_umask)
+
+    assert (tmp_path / "private").stat().st_mode & 0o777 == 0o700
+    assert (tmp_path / "private" / "data.txt").stat().st_mode & 0o777 == 0o600

@@ -50,6 +50,41 @@ def test_parse_fallback_and_exception(agent):
     assert not tool_calls
 
 
+@pytest.mark.parametrize(
+    ("schema", "value", "expected"),
+    [
+        ({"type": ["integer"]}, "42", 42),
+        ({"type": ["number"]}, "-1.5e2", -150.0),
+        ({"type": ["number"]}, "9" * 309, int("9" * 309)),
+        ({"type": ["boolean"]}, "true", True),
+        ({"type": ["boolean"]}, "0", False),
+        ({"type": ["integer", "null"]}, "null", None),
+    ],
+)
+def test_cast_param_converts_declared_scalar_types(schema, value, expected):
+    assert SimpleAgent._cast_param(value, schema) == expected
+
+
+@pytest.mark.parametrize(
+    ("schema", "value"),
+    [
+        ({"type": ["integer"]}, "10; command"),
+        ({"type": ["number"]}, "NaN"),
+        ({"type": ["number"]}, "1.2.3"),
+        ({"type": ["boolean"]}, "yes"),
+    ],
+)
+def test_cast_param_rejects_malformed_declared_scalar_types(schema, value):
+    with pytest.raises(ValueError, match="Expected"):
+        SimpleAgent._cast_param(value, schema)
+
+
+def test_cast_param_preserves_string_when_schema_explicitly_allows_it():
+    schema = {"type": ["string", "number"]}
+
+    assert SimpleAgent._cast_param("not-a-number", schema) == "not-a-number"
+
+
 class MockTool(EnvironmentTool):
     """Mock tool for testing."""
 
